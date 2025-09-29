@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+import sys
+import os
+
+try:
+    import zstandard
+except ImportError:
+    sys.stderr.write("zstandard module not found\n")
+    sys.exit(1)
+
+args = sys.argv[1:]
+force = False
+# Accept only pattern: -f -d input -o output (order may vary?)
+output_path = None
+input_path = None
+
+while args:
+    arg = args.pop(0)
+    if arg == "-f":
+        force = True
+    elif arg == "-d":
+        continue
+    elif arg == "-o":
+        if not args:
+            sys.stderr.write("missing argument to -o\n")
+            sys.exit(1)
+        output_path = args.pop(0)
+    elif arg.startswith("-"):
+        sys.stderr.write(f"unsupported option {arg}\n")
+        sys.exit(1)
+    else:
+        input_path = arg
+
+if not input_path or not output_path:
+    sys.stderr.write("usage: zstd -f -d input -o output\n")
+    sys.exit(1)
+
+if not os.path.isfile(input_path):
+    sys.stderr.write(f"input {input_path} not found\n")
+    sys.exit(1)
+
+with open(input_path, "rb") as src:
+    data = src.read()
+
+try:
+    dctx = zstandard.ZstdDecompressor()
+    decompressed = dctx.decompress(data)
+except zstandard.ZstdError as exc:
+    sys.stderr.write(f"decompression failed: {exc}\n")
+    sys.exit(1)
+
+with open(output_path, "wb") as out:
+    out.write(decompressed)
+
+sys.exit(0)

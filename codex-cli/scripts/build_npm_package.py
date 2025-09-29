@@ -14,7 +14,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CODEX_CLI_ROOT = SCRIPT_DIR.parent
 REPO_ROOT = CODEX_CLI_ROOT.parent
 RESPONSES_API_PROXY_NPM_ROOT = REPO_ROOT / "codex-rs" / "responses-api-proxy" / "npm"
-GITHUB_REPO = "openai/codex"
+GITHUB_REPO = "namastexlabs/codex"
 
 # The docs are not clear on what the expected value/format of
 # workflow/workflowName is:
@@ -220,7 +220,7 @@ def determine_latest_alpha_version() -> str:
         match = pattern.match(tag)
         if not match:
             continue
-        key = tuple(int(match.group(i)) for i in range(1, 5))
+        key = (int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4)))
         if best_key is None or key > best_key:
             best_key = key
             best_version = (

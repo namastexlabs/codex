@@ -1022,15 +1022,14 @@ impl Config {
                 resolved_cwd.join(p)
             }
         });
-        if let Some(file) = append_user_instructions_file.as_ref() {
-            if let Some(extra_instructions) =
+        if let Some(file) = append_user_instructions_file.as_ref()
+            && let Some(extra_instructions) =
                 Self::get_base_instructions(Some(file), &resolved_cwd)?
-            {
-                user_instructions = Some(match user_instructions {
-                    Some(existing) => format!("{}\n\n{}", existing, extra_instructions),
-                    None => extra_instructions,
-                });
-            }
+        {
+            user_instructions = Some(match user_instructions {
+                Some(existing) => format!("{existing}\n\n{extra_instructions}"),
+                None => extra_instructions,
+            });
         }
 
         // Default review model when not set in config; allow CLI override to take precedence.

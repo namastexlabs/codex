@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 
-REPO = "openai/codex"
+REPO = "namastexlabs/codex"
 BRANCH_REF = "heads/main"
 CARGO_TOML_PATH = "codex-rs/Cargo.toml"
 
@@ -253,13 +253,7 @@ def determine_version(args: argparse.Namespace) -> str:
     return f"{alpha_prefix}1"
 
 
-def get_latest_release_version() -> str:
-    response = run_gh_api(f"/repos/{REPO}/releases/latest")
-    tag = response.get("tag_name")
-    version = strip_tag_prefix(tag)
-    if not version:
-        raise ReleaseError("Latest release tag has unexpected format.")
-    return version
+def get_latest_release_version() -> str:\n    try:\n        response = run_gh_api(f\"/repos/{REPO}/releases/latest\")\n        tag = response.get(\"tag_name\")\n        version = strip_tag_prefix(tag)\n        if not version:\n            raise ReleaseError(\"Latest release tag has unexpected format.\")\n        return version\n    except ReleaseError:\n        # For first release, start with 0.1.0\n        return \"0.0.0\"
 
 
 def list_releases() -> list[dict]:
