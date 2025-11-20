@@ -9,8 +9,11 @@ use crate::apply_patch::convert_apply_patch_to_protocol;
 use crate::codex::TurnContext;
 use crate::exec::ExecParams;
 use crate::exec_env::create_env;
+use crate::exec_policy::create_approval_requirement_for_command;
 use crate::function_tool::FunctionCallError;
 use crate::is_safe_command::is_known_safe_command;
+use crate::protocol::ExecCommandSource;
+use crate::sandboxing::SandboxPermissions;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -129,7 +132,7 @@ impl ToolHandler for ShellHandler {
                     turn,
                     tracker,
                     call_id,
-                    true,
+                    false,
                 )
                 .await
             }
@@ -177,7 +180,7 @@ impl ToolHandler for ShellCommandHandler {
             turn,
             tracker,
             call_id,
-            false,
+            true,
         )
         .await
     }
@@ -191,7 +194,7 @@ impl ShellHandler {
         turn: Arc<TurnContext>,
         tracker: crate::tools::context::SharedTurnDiffTracker,
         call_id: String,
-        is_user_shell_command: bool,
+        freeform: bool,
     ) -> Result<ToolOutput, FunctionCallError> {
         // Approval policy guard for explicit escalation in non-OnRequest modes.
         if exec_params.with_escalated_permissions.unwrap_or(false)
@@ -284,11 +287,12 @@ impl ShellHandler {
             }
         }
 
-        // Regular shell execution path.
+        let source = ExecCommandSource::Agent;
         let emitter = ToolEmitter::shell(
             exec_params.command.clone(),
             exec_params.cwd.clone(),
-            is_user_shell_command,
+            source,
+            freeform,
         );
         let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, None);
         emitter.begin(event_ctx).await;
@@ -300,6 +304,13 @@ impl ShellHandler {
             env: exec_params.env.clone(),
             with_escalated_permissions: exec_params.with_escalated_permissions,
             justification: exec_params.justification.clone(),
+            approval_requirement: create_approval_requirement_for_command(
+                &turn.exec_policy,
+                &exec_params.command,
+                turn.approval_policy,
+                &turn.sandbox_policy,
+                SandboxPermissions::from(exec_params.with_escalated_permissions.unwrap_or(false)),
+            ),
         };
         let mut orchestrator = ToolOrchestrator::new();
         let mut runtime = ShellRuntime::new();
@@ -324,8 +335,11 @@ impl ShellHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use crate::is_safe_command::is_known_safe_command;
     use crate::shell::BashShell;
+    use crate::shell::PowerShellConfig;
     use crate::shell::Shell;
     use crate::shell::ZshShell;
 
@@ -335,27 +349,19 @@ mod tests {
     #[test]
     fn commands_generated_by_shell_command_handler_can_be_matched_by_is_known_safe_command() {
         let bash_shell = Shell::Bash(BashShell {
-            shell_path: "/bin/bash".to_string(),
-            bashrc_path: "/home/user/.bashrc".to_string(),
+            shell_path: PathBuf::from("/bin/bash"),
         });
         assert_safe(&bash_shell, "ls -la");
 
         let zsh_shell = Shell::Zsh(ZshShell {
-            shell_path: "/bin/zsh".to_string(),
-            zshrc_path: "/home/user/.zshrc".to_string(),
+            shell_path: PathBuf::from("/bin/zsh"),
         });
         assert_safe(&zsh_shell, "ls -la");
 
-        #[cfg(target_os = "windows")]
-        {
-            use crate::shell::PowerShellConfig;
-
-            let powershell = Shell::PowerShell(PowerShellConfig {
-                exe: "pwsh.exe".to_string(),
-                bash_exe_fallback: None,
-            });
-            assert_safe(&powershell, "ls -Name");
-        }
+        let powershell = Shell::PowerShell(PowerShellConfig {
+            shell_path: PathBuf::from("pwsh.exe"),
+        });
+        assert_safe(&powershell, "ls -Name");
     }
 
     fn assert_safe(shell: &Shell, command: &str) {
