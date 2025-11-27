@@ -1,0 +1,203 @@
+name: Rust CI (namastex)
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Hybrid CI: Self-hosted for Linux, GitHub-hosted for macOS/Windows
+
+jobs:
+  # --- Detect changes ---------------------------------------------------------
+  changed:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    outputs:
+      codex: ${{ steps.detect.outputs.codex }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Detect changed paths
+        id: detect
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_SHA='${{ github.event.pull_request.base.sha }}'
+            mapfile -t files < <(git diff --name-only --no-renames "$BASE_SHA"...HEAD)
+          else
+            files=("codex-rs/force")
+          fi
+          codex=false
+          for f in "${files[@]}"; do
+            [[ $f == codex-rs/* ]] && codex=true
+          done
+          echo "codex=$codex" >> "$GITHUB_OUTPUT"
+
+  # --- Format and lint (self-hosted) ------------------------------------------
+  lint:
+    name: Format / Lint
+    runs-on: [self-hosted, Linux, X64, codex]
+    needs: changed
+    if: ${{ needs.changed.outputs.codex == 'true' || github.event_name == 'push' }}
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      CARGO_HOME: /opt/cargo-home
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: /opt/sccache
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: cargo fmt
+        run: cargo fmt -- --config imports_granularity=Item --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-features --tests -- -D warnings
+
+      - name: Verify mcp-types codegen
+        run: ./mcp-types/check_lib_rs.py
+
+  # --- Linux builds (self-hosted, fast) ---------------------------------------
+  build-linux:
+    name: Build Linux — ${{ matrix.target }}
+    runs-on: [self-hosted, Linux, X64, codex]
+    needs: changed
+    if: ${{ needs.changed.outputs.codex == 'true' || github.event_name == 'push' }}
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      CARGO_HOME: /opt/cargo-home
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: /opt/sccache
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            use_zigbuild: false
+          - target: x86_64-unknown-linux-musl
+            use_zigbuild: false
+          - target: aarch64-unknown-linux-gnu
+            use_zigbuild: true
+          - target: aarch64-unknown-linux-musl
+            use_zigbuild: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build
+        run: |
+          if [[ "${{ matrix.use_zigbuild }}" == "true" ]]; then
+            cargo zigbuild --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+  # --- Tests (self-hosted) ----------------------------------------------------
+  test-linux:
+    name: Tests Linux
+    runs-on: [self-hosted, Linux, X64, codex]
+    needs: changed
+    if: ${{ needs.changed.outputs.codex == 'true' || github.event_name == 'push' }}
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      CARGO_HOME: /opt/cargo-home
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: /opt/sccache
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run tests
+        run: cargo nextest run --all-features --no-fail-fast
+
+  # --- macOS builds (GitHub-hosted for signing capability) --------------------
+  build-macos:
+    name: Build macOS — ${{ matrix.target }}
+    runs-on: macos-14
+    needs: changed
+    if: ${{ needs.changed.outputs.codex == 'true' || github.event_name == 'push' }}
+    defaults:
+      run:
+        working-directory: codex-rs
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+  # --- Windows builds (GitHub-hosted) -----------------------------------------
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    needs: changed
+    if: ${{ needs.changed.outputs.codex == 'true' || github.event_name == 'push' }}
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+  # --- Results aggregator -----------------------------------------------------
+  results:
+    name: CI Results
+    needs: [changed, lint, build-linux, test-linux, build-macos, build-windows]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          echo "lint:          ${{ needs.lint.result }}"
+          echo "build-linux:   ${{ needs.build-linux.result }}"
+          echo "test-linux:    ${{ needs.test-linux.result }}"
+          echo "build-macos:   ${{ needs.build-macos.result }}"
+          echo "build-windows: ${{ needs.build-windows.result }}"
+
+          if [[ '${{ needs.changed.outputs.codex }}' != 'true' && '${{ github.event_name }}' != 'push' ]]; then
+            echo 'No relevant changes -> CI passed.'
+            exit 0
+          fi
+
+          # All jobs must succeed
+          [[ '${{ needs.lint.result }}' == 'success' ]] || exit 1
+          [[ '${{ needs.build-linux.result }}' == 'success' ]] || exit 1
+          [[ '${{ needs.test-linux.result }}' == 'success' ]] || exit 1
+          [[ '${{ needs.build-macos.result }}' == 'success' ]] || exit 1
+          [[ '${{ needs.build-windows.result }}' == 'success' ]] || exit 1
+
+          echo 'All checks passed!'

@@ -1,0 +1,278 @@
+# Release workflow for namastex fork of codex-rs.
+# To release:
+# ```
+# git tag -a rust-v0.63.0-namastex -m "Release 0.63.0"
+# git push origin rust-v0.63.0-namastex
+# ```
+
+name: Release (namastex)
+
+on:
+  push:
+    tags:
+      - "rust-v*.*.*-namastex"
+      - "rust-v*.*.*-namastex-*"
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  # --- Validate tag -----------------------------------------------------------
+  validate:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+      tag: ${{ steps.extract.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Extract and validate version
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+
+          # Must be a tag
+          [[ "${GITHUB_REF_TYPE}" == "tag" ]] \
+            || { echo "Not a tag push"; exit 1; }
+
+          # Extract version: rust-v0.63.0-namastex -> 0.63.0
+          VERSION=$(echo "$TAG" | sed -E 's/rust-v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version: $VERSION from tag: $TAG"
+
+  # --- Linux builds (self-hosted, fast) ---------------------------------------
+  build-linux:
+    name: Build Linux — ${{ matrix.artifact }}
+    needs: validate
+    runs-on: [self-hosted, Linux, X64, codex]
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      CARGO_HOME: /opt/cargo-home
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: /opt/sccache
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            artifact: codex-linux-x64
+            use_zigbuild: false
+          - target: x86_64-unknown-linux-musl
+            artifact: codex-linux-x64-musl
+            use_zigbuild: false
+          - target: aarch64-unknown-linux-gnu
+            artifact: codex-linux-arm64
+            use_zigbuild: true
+          - target: aarch64-unknown-linux-musl
+            artifact: codex-linux-arm64-musl
+            use_zigbuild: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build
+        run: |
+          if [[ "${{ matrix.use_zigbuild }}" == "true" ]]; then
+            cargo zigbuild --release --target ${{ matrix.target }} --bin codex
+          else
+            cargo build --release --target ${{ matrix.target }} --bin codex
+          fi
+
+      - name: Package artifact
+        run: |
+          mkdir -p ../artifacts
+          cp target/${{ matrix.target }}/release/codex ../artifacts/${{ matrix.artifact }}
+          cd ../artifacts
+          tar czvf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+          rm ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: codex-rs/../artifacts/${{ matrix.artifact }}.tar.gz
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+  # --- macOS builds (GitHub-hosted for code signing) --------------------------
+  build-macos:
+    name: Build macOS — ${{ matrix.artifact }}
+    needs: validate
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: codex-rs
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            artifact: codex-macos-arm64
+          - target: x86_64-apple-darwin
+            artifact: codex-macos-x64
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} --bin codex
+
+      # Optional code signing (only if secrets are configured)
+      - name: Configure Apple code signing
+        if: ${{ secrets.APPLE_CERTIFICATE_P12 != '' }}
+        shell: bash
+        env:
+          KEYCHAIN_PASSWORD: actions
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [[ -z "${APPLE_CERTIFICATE:-}" ]]; then
+            echo "Skipping code signing - no certificate configured"
+            exit 0
+          fi
+
+          cert_path="${RUNNER_TEMP}/apple_signing_certificate.p12"
+          echo "$APPLE_CERTIFICATE" | base64 -d > "$cert_path"
+
+          keychain_path="${RUNNER_TEMP}/codex-signing.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security list-keychains -s "$keychain_path"
+          security default-keychain -s "$keychain_path"
+          security import "$cert_path" -k "$keychain_path" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain_path" > /dev/null
+
+          IDENTITY=$(security find-identity -v -p codesigning "$keychain_path" | sed -n 's/.*\([0-9A-F]\{40\}\).*/\1/p' | head -1)
+          echo "APPLE_CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          rm -f "$cert_path"
+
+      - name: Sign macOS binary
+        if: ${{ env.APPLE_CODESIGN_IDENTITY != '' }}
+        run: |
+          codesign --force --options runtime --timestamp --sign "$APPLE_CODESIGN_IDENTITY" \
+            target/${{ matrix.target }}/release/codex
+
+      - name: Package artifact
+        run: |
+          mkdir -p ../artifacts
+          cp target/${{ matrix.target }}/release/codex ../artifacts/${{ matrix.artifact }}
+          cd ../artifacts
+          zip ${{ matrix.artifact }}.zip ${{ matrix.artifact }}
+          rm ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: codex-rs/../artifacts/${{ matrix.artifact }}.zip
+
+  # --- Windows build (GitHub-hosted) ------------------------------------------
+  build-windows:
+    name: Build Windows
+    needs: validate
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc --bin codex
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ..\artifacts
+          Copy-Item target\x86_64-pc-windows-msvc\release\codex.exe ..\artifacts\codex-windows-x64.exe
+          Compress-Archive -Path ..\artifacts\codex-windows-x64.exe -DestinationPath ..\artifacts\codex-windows-x64.zip
+          Remove-Item ..\artifacts\codex-windows-x64.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-windows-x64
+          path: codex-rs/../artifacts/codex-windows-x64.zip
+
+  # --- Create GitHub Release --------------------------------------------------
+  release:
+    name: Create Release
+    needs: [validate, build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ needs.validate.outputs.version }} (namastex)
+          tag_name: ${{ needs.validate.outputs.tag }}
+          draft: false
+          prerelease: ${{ contains(needs.validate.outputs.tag, 'alpha') || contains(needs.validate.outputs.tag, 'beta') }}
+          generate_release_notes: false
+          files: artifacts/*
+          body: |
+            ## Codex v${{ needs.validate.outputs.version }} (namastex fork)
+
+            This is a release of the namastex fork of [OpenAI Codex](https://github.com/openai/codex).
+
+            ### Downloads
+
+            | Platform | Architecture | File |
+            |----------|--------------|------|
+            | Linux | x64 (glibc) | `codex-linux-x64.tar.gz` |
+            | Linux | x64 (static/musl) | `codex-linux-x64-musl.tar.gz` |
+            | Linux | ARM64 (glibc) | `codex-linux-arm64.tar.gz` |
+            | Linux | ARM64 (static/musl) | `codex-linux-arm64-musl.tar.gz` |
+            | macOS | Apple Silicon | `codex-macos-arm64.zip` |
+            | macOS | Intel | `codex-macos-x64.zip` |
+            | Windows | x64 | `codex-windows-x64.zip` |
+
+            ### Installation
+
+            ```bash
+            # Linux/macOS
+            tar xzf codex-linux-x64.tar.gz  # or unzip for macOS/Windows
+            chmod +x codex
+            ./codex --version
+
+            # Or move to PATH
+            sudo mv codex /usr/local/bin/
+            ```
+
+            ---
+            Built from tag: `${{ needs.validate.outputs.tag }}`
